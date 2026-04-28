@@ -1,4 +1,4 @@
-const CACHE_NAME = "poise-click-v2";
+const CACHE_NAME = "poise-click-v3";
 const REMINDER_PATH = "/poise-reminders.ics";
 const REMINDER_ICS = `BEGIN:VCALENDAR
 VERSION:2.0
@@ -90,10 +90,10 @@ END:VCALENDAR`;
 const APP_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=20260427r2",
-  "./app.js?v=20260427r2",
-  "./manifest.webmanifest?v=20260427r2",
-  "./icon.svg?v=20260427r2"
+  "./styles.css?v=20260428r1",
+  "./app.js?v=20260428r1",
+  "./manifest.webmanifest?v=20260428r1",
+  "./icon.svg?v=20260428r1"
 ];
 
 self.addEventListener("install", (event) => {
