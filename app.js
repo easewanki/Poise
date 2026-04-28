@@ -1,4 +1,7 @@
 const STORAGE_KEY = "poise.click.state.v1";
+const APP_SCHEMA_VERSION = 2;
+const SYNC_CODE_PREFIX = "POISE_SYNC_V1:";
+const SYNC_FILE_PREFIX = "poise-sync-backup";
 
 const knowledgeCards = [
   {
@@ -503,6 +506,62 @@ const state = {
 
 state.homeTipOpen = !state.appData.preferences.homeTipDismissed;
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function clamp(value, min, max, fallback = min) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(Math.max(numeric, min), max);
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function ensureIso(value, fallback = nowIso()) {
+  if (typeof value !== "string" || !value) return fallback;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
+}
+
+function ensureStartDate(value, fallback = nowIso()) {
+  const parsed = new Date(value || fallback);
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
+}
+
+function createDeviceId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `device-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function latestIso(values, fallback = nowIso()) {
+  return values
+    .map((value) => ensureIso(value, fallback))
+    .sort()
+    .at(-1) || fallback;
+}
+
+function latestAppDataTimestamp(data) {
+  const values = [
+    data?.lastUpdatedAt,
+    data?.startDateUpdatedAt,
+    data?.programResetAt,
+    data?.preferences?.updatedAt
+  ];
+
+  Object.values(data?.progressUpdatedAtByDay || {}).forEach((dayMap) => {
+    Object.values(dayMap || {}).forEach((updatedAt) => values.push(updatedAt));
+  });
+
+  Object.values(data?.reflectionsByDay || {}).forEach((reflection) => {
+    values.push(reflection?.updatedAt);
+  });
+
+  return latestIso(values, nowIso());
+}
+
 function loadAppData() {
   try {
     return normalizeAppData(JSON.parse(localStorage.getItem(STORAGE_KEY)));
@@ -512,18 +571,293 @@ function loadAppData() {
 }
 
 function normalizeAppData(input) {
-  return {
-    startDate: input?.startDate || new Date().toISOString(),
-    progressByDay: input?.progressByDay || {},
-    reflectionsByDay: input?.reflectionsByDay || {},
-    preferences: {
-      homeTipDismissed: Boolean(input?.preferences?.homeTipDismissed)
+  const fallbackTime = ensureIso(
+    input?.lastUpdatedAt || input?.programResetAt || input?.startDateUpdatedAt,
+    nowIso()
+  );
+  const progressByDay = {};
+  const progressUpdatedAtByDay = {};
+
+  Object.entries(isRecord(input?.progressByDay) ? input.progressByDay : {}).forEach(([key, dayMap]) => {
+    if (!isRecord(dayMap)) return;
+    const normalizedDay = {};
+    const normalizedMeta = {};
+
+    Object.entries(dayMap).forEach(([exerciseId, units]) => {
+      const numeric = Number(units);
+      if (!Number.isFinite(numeric)) return;
+      normalizedDay[exerciseId] = Math.max(0, numeric);
+      normalizedMeta[exerciseId] = ensureIso(
+        input?.progressUpdatedAtByDay?.[key]?.[exerciseId],
+        fallbackTime
+      );
+    });
+
+    if (Object.keys(normalizedDay).length) {
+      progressByDay[key] = normalizedDay;
+      progressUpdatedAtByDay[key] = normalizedMeta;
     }
+  });
+
+  const reflectionsByDay = {};
+  Object.entries(isRecord(input?.reflectionsByDay) ? input.reflectionsByDay : {}).forEach(
+    ([key, reflection]) => {
+      if (!isRecord(reflection)) return;
+      reflectionsByDay[key] = {
+        postureScore: clamp(reflection.postureScore, 1, 5, 3),
+        gaitScore: clamp(reflection.gaitScore, 1, 5, 3),
+        mindsetScore: clamp(reflection.mindsetScore, 1, 5, 3),
+        note: typeof reflection.note === "string" ? reflection.note : "",
+        updatedAt: ensureIso(reflection.updatedAt, fallbackTime)
+      };
+    }
+  );
+
+  return {
+    schemaVersion: APP_SCHEMA_VERSION,
+    deviceId: typeof input?.deviceId === "string" && input.deviceId ? input.deviceId : createDeviceId(),
+    startDate: ensureStartDate(input?.startDate, fallbackTime),
+    startDateUpdatedAt: ensureIso(input?.startDateUpdatedAt, fallbackTime),
+    programResetAt: ensureIso(input?.programResetAt || input?.startDateUpdatedAt, fallbackTime),
+    progressByDay,
+    progressUpdatedAtByDay,
+    reflectionsByDay,
+    preferences: {
+      homeTipDismissed: Boolean(input?.preferences?.homeTipDismissed),
+      updatedAt: ensureIso(input?.preferences?.updatedAt, fallbackTime)
+    },
+    lastUpdatedAt: ensureIso(input?.lastUpdatedAt, fallbackTime)
   };
 }
 
-function saveAppData() {
+function saveAppData(updatedAt = latestAppDataTimestamp(state.appData)) {
+  state.appData.lastUpdatedAt = ensureIso(updatedAt, nowIso());
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state.appData));
+}
+
+function copyToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.setAttribute("readonly", "true");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    try {
+      document.execCommand("copy");
+      document.body.removeChild(input);
+      resolve();
+    } catch (error) {
+      document.body.removeChild(input);
+      reject(error);
+    }
+  });
+}
+
+function utf8ToBase64(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+function base64ToUtf8(value) {
+  const binary = atob(value);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function activeRecordDays(data = state.appData) {
+  return Object.values(data.progressByDay || {}).filter((dayMap) =>
+    Object.values(dayMap || {}).some((value) => value > 0)
+  ).length;
+}
+
+function totalCompletedSessionsFor(data = state.appData) {
+  return Object.values(data.progressByDay || {}).reduce((sum, dayMap) => {
+    return sum + Object.values(dayMap || {}).filter((value) => value > 0).length;
+  }, 0);
+}
+
+function syncSnapshot() {
+  return {
+    activeDays: activeRecordDays(),
+    completedEntries: totalCompletedSessionsFor(),
+    updatedAt: latestAppDataTimestamp(state.appData)
+  };
+}
+
+function syncTimestampLabel(value) {
+  const iso = ensureIso(value, nowIso());
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(iso));
+}
+
+function buildSyncPayload() {
+  return {
+    version: 1,
+    app: "Poise",
+    exportedAt: nowIso(),
+    source: {
+      deviceId: state.appData.deviceId,
+      page: window.location.href
+    },
+    appData: normalizeAppData(state.appData)
+  };
+}
+
+function buildSyncCode() {
+  return `${SYNC_CODE_PREFIX}${utf8ToBase64(JSON.stringify(buildSyncPayload()))}`;
+}
+
+function downloadSyncBackup() {
+  const stamp = nowIso().slice(0, 10);
+  const blob = new Blob([JSON.stringify(buildSyncPayload(), null, 2)], {
+    type: "application/json"
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${SYNC_FILE_PREFIX}-${stamp}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+function parseSyncPayload(rawValue) {
+  const trimmed = rawValue.trim();
+  if (!trimmed) throw new Error("请先粘贴同步码或备份 JSON。");
+
+  let parsed = null;
+  if (trimmed.startsWith(SYNC_CODE_PREFIX)) {
+    parsed = JSON.parse(base64ToUtf8(trimmed.slice(SYNC_CODE_PREFIX.length)));
+  } else {
+    parsed = JSON.parse(trimmed);
+  }
+
+  if (isRecord(parsed?.appData)) {
+    return normalizeAppData(parsed.appData);
+  }
+
+  if (isRecord(parsed)) {
+    return normalizeAppData(parsed);
+  }
+
+  throw new Error("同步内容格式不对。");
+}
+
+function compareIso(left, right) {
+  const leftIso = ensureIso(left, "1970-01-01T00:00:00.000Z");
+  const rightIso = ensureIso(right, "1970-01-01T00:00:00.000Z");
+  if (leftIso === rightIso) return 0;
+  return leftIso > rightIso ? 1 : -1;
+}
+
+function mergeAppData(currentData, incomingData) {
+  const current = normalizeAppData(currentData);
+  const incoming = normalizeAppData(incomingData);
+  const resetOwner =
+    compareIso(incoming.programResetAt, current.programResetAt) >= 0 ? incoming : current;
+  const merged = normalizeAppData({
+    deviceId: current.deviceId,
+    startDate: resetOwner.startDate,
+    startDateUpdatedAt: resetOwner.startDateUpdatedAt,
+    programResetAt: resetOwner.programResetAt,
+    preferences:
+      compareIso(incoming.preferences.updatedAt, current.preferences.updatedAt) >= 0
+        ? incoming.preferences
+        : current.preferences
+  });
+  const effectiveResetAt = merged.programResetAt;
+
+  const progressDayKeys = new Set([
+    ...Object.keys(current.progressByDay || {}),
+    ...Object.keys(incoming.progressByDay || {})
+  ]);
+
+  progressDayKeys.forEach((key) => {
+    const exerciseIds = new Set([
+      ...Object.keys(current.progressByDay[key] || {}),
+      ...Object.keys(incoming.progressByDay[key] || {})
+    ]);
+
+    exerciseIds.forEach((exerciseId) => {
+      const currentUpdatedAt = current.progressUpdatedAtByDay[key]?.[exerciseId];
+      const incomingUpdatedAt = incoming.progressUpdatedAtByDay[key]?.[exerciseId];
+
+      const currentIsValid =
+        currentUpdatedAt && compareIso(currentUpdatedAt, effectiveResetAt) >= 0;
+      const incomingIsValid =
+        incomingUpdatedAt && compareIso(incomingUpdatedAt, effectiveResetAt) >= 0;
+
+      if (!currentIsValid && !incomingIsValid) return;
+
+      const pickIncoming =
+        incomingIsValid &&
+        (!currentIsValid || compareIso(incomingUpdatedAt, currentUpdatedAt) >= 0);
+
+      const value = pickIncoming
+        ? incoming.progressByDay[key]?.[exerciseId] ?? 0
+        : current.progressByDay[key]?.[exerciseId] ?? 0;
+      const updatedAt = pickIncoming ? incomingUpdatedAt : currentUpdatedAt;
+
+      merged.progressByDay[key] = {
+        ...(merged.progressByDay[key] || {}),
+        [exerciseId]: value
+      };
+      merged.progressUpdatedAtByDay[key] = {
+        ...(merged.progressUpdatedAtByDay[key] || {}),
+        [exerciseId]: updatedAt
+      };
+    });
+  });
+
+  const reflectionKeys = new Set([
+    ...Object.keys(current.reflectionsByDay || {}),
+    ...Object.keys(incoming.reflectionsByDay || {})
+  ]);
+
+  reflectionKeys.forEach((key) => {
+    const currentReflection = current.reflectionsByDay[key];
+    const incomingReflection = incoming.reflectionsByDay[key];
+    const currentValid =
+      currentReflection && compareIso(currentReflection.updatedAt, effectiveResetAt) >= 0;
+    const incomingValid =
+      incomingReflection && compareIso(incomingReflection.updatedAt, effectiveResetAt) >= 0;
+
+    if (!currentValid && !incomingValid) return;
+
+    merged.reflectionsByDay[key] =
+      incomingValid &&
+      (!currentValid || compareIso(incomingReflection.updatedAt, currentReflection.updatedAt) >= 0)
+        ? incomingReflection
+        : currentReflection;
+  });
+
+  merged.lastUpdatedAt = latestAppDataTimestamp(merged);
+  return merged;
+}
+
+function applySyncImport(rawValue, mode) {
+  const imported = parseSyncPayload(rawValue);
+  state.appData =
+    mode === "replace"
+      ? normalizeAppData({ ...imported, deviceId: state.appData.deviceId })
+      : mergeAppData(state.appData, imported);
+  state.homeTipOpen = !state.appData.preferences.homeTipDismissed;
+  saveAppData();
 }
 
 function dayKey(date = new Date()) {
@@ -706,8 +1040,13 @@ function progressFor(exercise, key = dayKey()) {
 function setProgress(exercise, units, key = dayKey()) {
   const capped = Math.min(Math.max(units, 0), targetUnits(exercise));
   const dayMap = state.appData.progressByDay[key] || {};
+  const updatedAt = nowIso();
   state.appData.progressByDay[key] = { ...dayMap, [exercise.id]: capped };
-  saveAppData();
+  state.appData.progressUpdatedAtByDay[key] = {
+    ...(state.appData.progressUpdatedAtByDay[key] || {}),
+    [exercise.id]: updatedAt
+  };
+  saveAppData(updatedAt);
 }
 
 function incrementProgress(exercise, amount = 1) {
@@ -754,9 +1093,7 @@ function streak() {
 }
 
 function totalCompletedSessions() {
-  return Object.values(state.appData.progressByDay).reduce((sum, dayMap) => {
-    return sum + Object.values(dayMap).filter((value) => value > 0).length;
-  }, 0);
+  return totalCompletedSessionsFor(state.appData);
 }
 
 function planForDate(date) {
@@ -813,8 +1150,9 @@ function reflectionFor(key = dayKey()) {
 }
 
 function saveReflection(next, key = dayKey()) {
-  state.appData.reflectionsByDay[key] = next;
-  saveAppData();
+  const updatedAt = nowIso();
+  state.appData.reflectionsByDay[key] = { ...next, updatedAt };
+  saveAppData(updatedAt);
 }
 
 function iconFor(category) {
@@ -1106,6 +1444,7 @@ function renderProgress() {
 function renderSettings() {
   const standalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone;
   const homeDismissed = state.appData.preferences.homeTipDismissed;
+  const sync = syncSnapshot();
   return `
     <article class="card">
       <h2 class="section-title">定时提醒</h2>
@@ -1219,9 +1558,33 @@ function renderSettings() {
     </article>
 
     <article class="card">
+      <h2 class="section-title">多端同步</h2>
+      <p class="section-subtitle">Manual cross-device sync</p>
+      <p class="theme">这版先给你做成不依赖服务器的跨设备同步。你可以在一台设备导出同步码或备份文件，再到另一台设备粘贴导入；适合 iPhone、iPad、Mac 之间迁移和合并进度。</p>
+      <div class="stats" style="margin-top:14px;">
+        <div class="stat"><strong>${sync.activeDays}</strong><span>有记录的天数</span></div>
+        <div class="stat"><strong>${sync.completedEntries}</strong><span>已记训练项</span></div>
+        <div class="stat"><strong>${escapeHtml(syncTimestampLabel(sync.updatedAt))}</strong><span>最近更新</span></div>
+      </div>
+      <div class="btn-row" style="margin-top:14px;">
+        <button class="primary-btn" data-copy-sync-code>复制同步码</button>
+        <button class="soft-btn" data-download-sync-backup>下载备份 JSON</button>
+      </div>
+      <div class="field-stack" style="margin-top:14px;">
+        <textarea id="sync-import-input" placeholder="把另一台设备导出的同步码，或备份 JSON，完整粘贴到这里"></textarea>
+        <div class="btn-row">
+          <button class="primary-btn" data-import-sync="merge">合并导入</button>
+          <button class="soft-btn" data-import-sync="replace">覆盖当前设备</button>
+        </div>
+      </div>
+      <p class="hint" style="margin-top:10px;">合并导入会尽量按较新的记录合并；覆盖当前设备会直接用导入内容替换这台设备上的进度。</p>
+      <p class="hint" style="margin-top:6px;">如果你用的是同一个 Apple 账号，复制同步码后，另一台设备通常可以直接粘贴；不方便粘贴时，就用备份 JSON 走 AirDrop、微信文件或 iCloud Drive。</p>
+    </article>
+
+    <article class="card">
       <h2 class="section-title">本地保存</h2>
       <p class="section-subtitle">Saved on this device</p>
-      <p class="theme">你在这里的训练进度、周总结和今日复盘都会保存在当前设备浏览器里。只要别清浏览器站点数据，它就会一直在。手机只要之前打开并缓存过，就算你电脑关机或临时断网，也更容易继续打开已缓存版本。</p>
+      <p class="theme">你在这里的训练进度、周总结和今日复盘都会保存在当前设备浏览器里。只要别清浏览器站点数据，它就会一直在。手机只要之前打开并缓存过，就算你电脑关机或临时断网，也更容易继续打开已缓存版本。多端同步不会自动后台发生，需要你手动导出再导入一次。</p>
     </article>
 
     <article class="card">
@@ -1328,6 +1691,49 @@ function bindBaseEvents() {
     });
   });
 
+  document.querySelectorAll("[data-copy-sync-code]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await copyToClipboard(buildSyncCode());
+        window.alert("同步码已经复制。去另一台设备粘贴导入就可以。");
+      } catch {
+        window.alert("这台设备没能直接复制，你可以改用“下载备份 JSON”。");
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-download-sync-backup]").forEach((button) => {
+    button.addEventListener("click", () => {
+      downloadSyncBackup();
+    });
+  });
+
+  document.querySelectorAll("[data-import-sync]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const input = document.getElementById("sync-import-input");
+      const rawValue = input?.value?.trim?.() || "";
+      if (!rawValue) {
+        window.alert("先把同步码或备份 JSON 粘贴进来。");
+        return;
+      }
+
+      const mode = button.dataset.importSync;
+      if (mode === "replace") {
+        const confirmed = window.confirm("覆盖当前设备会直接替换这台设备上的进度，确定继续吗？");
+        if (!confirmed) return;
+      }
+
+      try {
+        applySyncImport(rawValue, mode);
+        if (input) input.value = "";
+        render();
+        window.alert(mode === "replace" ? "已经覆盖到当前设备。" : "已经合并到当前设备。");
+      } catch (error) {
+        window.alert(error?.message || "导入失败，请检查同步码或 JSON 是否完整。");
+      }
+    });
+  });
+
   document.querySelectorAll("[data-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       state.filter = button.dataset.filter;
@@ -1364,9 +1770,11 @@ function bindBaseEvents() {
 
   document.querySelectorAll("[data-dismiss-home-tip]").forEach((button) => {
     button.addEventListener("click", () => {
+      const updatedAt = nowIso();
       state.homeTipOpen = false;
       state.appData.preferences.homeTipDismissed = true;
-      saveAppData();
+      state.appData.preferences.updatedAt = updatedAt;
+      saveAppData(updatedAt);
       render();
     });
   });
@@ -1378,12 +1786,16 @@ function bindBaseEvents() {
       stopTimer();
       state.modalExerciseId = null;
       state.filter = "all";
+      const resetAt = nowIso();
       state.appData = normalizeAppData({
-        startDate: new Date().toISOString(),
+        deviceId: state.appData.deviceId,
+        startDate: resetAt,
+        startDateUpdatedAt: resetAt,
+        programResetAt: resetAt,
         preferences: state.appData.preferences
       });
       state.homeTipOpen = !state.appData.preferences.homeTipDismissed;
-      saveAppData();
+      saveAppData(resetAt);
       render();
     });
   });
@@ -1790,6 +2202,15 @@ function closeModal() {
   state.modalExerciseId = null;
   renderModal();
 }
+
+window.addEventListener("storage", (event) => {
+  if (event.key !== STORAGE_KEY || !event.newValue) return;
+  try {
+    state.appData = normalizeAppData(JSON.parse(event.newValue));
+    state.homeTipOpen = !state.appData.preferences.homeTipDismissed;
+    render();
+  } catch {}
+});
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeModal();
